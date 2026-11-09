@@ -1,1 +1,1 @@
-# tp_procesamiento_de_imagenes_2
+# tp2_procesamiento_de_imagenes
