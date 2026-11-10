@@ -1,10 +1,10 @@
 """
-patentes.py
-===========
+problema_2.py
+=============
 Localización y segmentación de los 6 caracteres de patentes argentinas (formato
 viejo: 3 letras + 3 números, caja negra con caracteres claros) en fotos de 640x360.
 
-El flujo completo tiene 3 etapas (cada una es una sección de este archivo):
+El flujo completo tiene 5 etapas (cada una es una sección de este archivo):
 
   1) LOCALIZAR la patente en la foto y recortarla.
         detectar_punto()  ->  recortar()
@@ -20,9 +20,13 @@ El flujo completo tiene 3 etapas (cada una es una sección de este archivo):
      las cajas. Los caracteres se recortan de la imagen girada (fila horizontal).
         calcular_giro()  ->  girar()
      La detección de las etapas 2 y 3 se hace SIN rotar: el giro no puede empeorarla.
+  5) SEGMENTAR LA PLACA: en el recorte ya derecho, se parte de la fila de caracteres y se
+     avanza hacia afuera (izquierda, derecha, arriba y abajo) mientras la columna o fila
+     siga siendo mayormente oscura. Así se obtiene la caja negra de la patente.
+        segmentar_placa()
 
 Punto de entrada:   analizar_foto(ruta)   -> Resultado
-Para verlo:         python patentes.py     (abre una ventana/pestaña por foto)
+Para verlo:         python problema_2.py   (abre una ventana/pestaña por foto e informa por consola)
                     ver_resultados(rutas)  (desde un notebook o un script)
 
 Convenciones
@@ -71,6 +75,9 @@ MARGEN_PROYECCION = 1.5   # ver proyectar_lado()
 ROTAR = True                              # False: no girar (el Resultado queda sin imagen girada)
 GIRO_INTERPOLACION = cv2.INTER_CUBIC      # interpolación al girar la imagen (no afecta a la detección)
 GIRO_BORDE = cv2.BORDER_REPLICATE         # relleno de los bordes que quedan vacíos al girar
+
+# --- Etapa 5: segmentación de la placa ---
+FRAC_OSCURO = 0.5     # una columna/fila sigue siendo placa si más de la mitad de sus píxeles son oscuros
 
 
 # ============================================================
@@ -126,6 +133,8 @@ class Resultado:
     rotado: Optional[np.ndarray] = None            # recorte color girado
     estirado_rotado: Optional[np.ndarray] = None   # recorte girado en grises (contraste estirado)
     binaria_rotada: Optional[np.ndarray] = None    # el girado, binarizado con UMBRAL_BINARIO (solo para mostrar)
+    placa: Optional[tuple] = None       # caja negra de la patente (x0, y0, x1, y1), en el recorte girado si hay giro
+    punto: Optional[tuple] = None       # (x, y) centro de la patente en la foto original (etapa 1)
 
     def cajas_finales(self):
         """Todas las cajas de la patente (detectadas + proyectadas) como tuplas
@@ -213,13 +222,19 @@ def detectar_punto(img: np.ndarray, recentrar: bool = True):
     return int(cx) + x0, int(cy) + y0, W, H
 
 
-def recortar(img: np.ndarray, punto, frac_w: float = RECORTE_W, frac_h: float = RECORTE_H) -> np.ndarray:
-    """Recorte rectangular de (frac_w * ancho) x (frac_h * alto) centrado en `punto`.
+def zona_recorte(img: np.ndarray, punto, frac_w: float = RECORTE_W, frac_h: float = RECORTE_H):
+    """Esquina superior izquierda (x0, y0), ancho y alto del recorte centrado en `punto`.
     Si el punto está cerca del borde de la foto, el recorte se desplaza (no se achica)."""
     h_img, w_img = img.shape[:2]
     cw, ch = int(frac_w * w_img), int(frac_h * h_img)
     x0 = min(max(0, punto[0] - cw // 2), w_img - cw)
     y0 = min(max(0, punto[1] - ch // 2), h_img - ch)
+    return x0, y0, cw, ch
+
+
+def recortar(img: np.ndarray, punto) -> np.ndarray:
+    """Recorte rectangular de RECORTE_W x RECORTE_H (fracción de la foto) centrado en `punto`."""
+    x0, y0, cw, ch = zona_recorte(img, punto)
     return img[y0:y0 + ch, x0:x0 + cw]
 
 
@@ -262,14 +277,14 @@ def componentes(binaria: np.ndarray) -> List[Caja]:
 
 def preparar_foto(ruta: str):
     """Lee la foto, localiza la patente, la recorta y la binariza.
-    Devuelve (recorte, estirado, binaria)."""
+    Devuelve (punto, recorte, estirado, binaria); `punto` es el centro de la patente en la foto."""
     img = cv2.imread(ruta, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"No se pudo leer la imagen: {ruta}")
     cx, cy, _, _ = detectar_punto(img)
     recorte = recortar(img, (cx, cy))
     estirado, binaria = preparar_binaria(recorte)
-    return recorte, estirado, binaria
+    return (cx, cy), recorte, estirado, binaria
 
 
 # ============================================================
@@ -450,11 +465,51 @@ def calcular_giro(encontradas: List[Caja], cajas: list, ancho: int, alto: int) -
 
 
 # ============================================================
+# ETAPA 5: SEGMENTAR LA PLACA (LA CAJA NEGRA DE LA PATENTE)
+# ============================================================
+
+def segmentar_placa(oscuro: np.ndarray, cajas: list):
+    """Delimita la caja negra de la patente a partir de la fila de caracteres.
+
+    oscuro: matriz de bools (True = píxel oscuro) del recorte, idealmente ya enderezado.
+    cajas: cajas de los caracteres como (x0, y0, x1, y1, tipo).
+
+    Se parte del rectángulo que encierra a los 6 caracteres y se lo agranda de a un píxel
+    hacia cada lado mientras la columna (o fila) nueva sea mayormente oscura (más de
+    FRAC_OSCURO): se sigue dentro de la caja negra. Al llegar al marco claro de la patente,
+    se frena. Por las dudas (fondo oscuro alrededor de la patente) nunca se agranda más de
+    un ancho de carácter hacia los costados ni más de un cuarto de alto hacia arriba/abajo.
+    Devuelve (x0, y0, x1, y1).
+    """
+    alto, ancho = oscuro.shape
+    x0 = max(0, int(min(c[0] for c in cajas)))           # sin salirse del recorte
+    y0 = max(0, int(min(c[1] for c in cajas)))
+    x1 = min(ancho - 1, int(max(c[2] for c in cajas)))
+    y1 = min(alto - 1, int(max(c[3] for c in cajas)))
+    ancho_car = cajas[0][2] - cajas[0][0]     # todas las cajas miden lo mismo (igualar_cajas)
+    alto_car = cajas[0][3] - cajas[0][1]
+
+    # límites: hasta dónde se puede agrandar como máximo
+    x_min, x_max = max(0, int(x0 - ancho_car)), min(ancho - 1, int(x1 + ancho_car))
+    y_min, y_max = max(0, int(y0 - alto_car / 4)), min(alto - 1, int(y1 + alto_car / 4))
+
+    while x0 > x_min and oscuro[y0:y1, x0 - 1].mean() > FRAC_OSCURO:   # hacia la izquierda
+        x0 -= 1
+    while x1 < x_max and oscuro[y0:y1, x1].mean() > FRAC_OSCURO:       # hacia la derecha
+        x1 += 1
+    while y0 > y_min and oscuro[y0 - 1, x0:x1].mean() > FRAC_OSCURO:   # hacia arriba
+        y0 -= 1
+    while y1 < y_max and oscuro[y1, x0:x1].mean() > FRAC_OSCURO:       # hacia abajo
+        y1 += 1
+    return x0, y0, x1, y1
+
+
+# ============================================================
 # FUNCIÓN PRINCIPAL
 # ============================================================
 
 def analizar_recorte(recorte: np.ndarray) -> Resultado:
-    """Etapas 2, 3 y 4 sobre un recorte ya extraído (la detección se hace SIN rotar)."""
+    """Etapas 2, 3, 4 y 5 sobre un recorte ya extraído (la detección se hace SIN rotar)."""
     estirado, binaria = preparar_binaria(recorte)
     candidatas = componentes(binaria)
     originales = cajas_de_area_similar(candidatas)
@@ -475,6 +530,12 @@ def analizar_recorte(recorte: np.ndarray) -> Resultado:
             res.rotado = girar(recorte, res.giro.matriz)
             res.estirado_rotado = girar(estirado, res.giro.matriz)
             res.binaria_rotada = np.where(res.estirado_rotado > UMBRAL_BINARIO, 255, 0).astype(np.uint8)
+
+    # Etapa 5: la caja negra de la patente (sobre el recorte girado, si se pudo girar)
+    if res.giro is not None:
+        res.placa = segmentar_placa(res.estirado_rotado <= UMBRAL_BINARIO, res.giro.cajas_giradas)
+    elif res.cajas_finales():
+        res.placa = segmentar_placa(estirado <= UMBRAL_BINARIO, res.cajas_finales())
     return res
 
 
@@ -488,8 +549,29 @@ def analizar_foto(ruta: str) -> Resultado:
     Si ROTAR=True y hay >= 2 caracteres detectados, `giro`, `rotado`, `estirado_rotado` y `binaria_rotada`
     traen el recorte enderezado y las cajas giradas.
     """
-    recorte, _, _ = preparar_foto(ruta)
-    return analizar_recorte(recorte)
+    punto, recorte, _, _ = preparar_foto(ruta)
+    res = analizar_recorte(recorte)
+    res.punto = punto
+    return res
+
+
+def informar(ruta: str, r: Resultado):
+    """Imprime por consola el resultado de cada etapa para una foto."""
+    print(f"\n=== {ruta} ===")
+    print(f"  1) Patente localizada: centro en (x={r.punto[0]}, y={r.punto[1]}) de la foto; "
+          f"recorte de {r.recorte.shape[1]}x{r.recorte.shape[0]} px")
+    print(f"  2) Componentes candidatas a carácter: {len(r.candidatas)}")
+    print(f"  3) Caracteres elegidos por área parecida: {len(r.encontradas)}  ->  estado: {r.estado}")
+    for q in r.proyectadas:
+        print(f"       deducido en la mitad {q.lado}: falta {q.motivo}")
+    if r.giro is not None:
+        print(f"  4) Inclinación corregida: {r.giro.angulo:+.1f}°")
+    else:
+        print("  4) Sin giro (menos de 2 caracteres detectados)")
+    if r.placa is not None:
+        x0, y0, x1, y1 = r.placa
+        print(f"  5) Placa segmentada: x={x0}..{x1}, y={y0}..{y1} ({x1 - x0}x{y1 - y0} px)")
+    print(f"  Caracteres segmentados: {len(r.cajas_finales())} de {N_CARACTERES}")
 
 
 # ============================================================
@@ -500,6 +582,7 @@ COLOR_CANDIDATA = (255, 200, 0)    # celeste: componentes candidatas
 COLOR_ORIGINAL = (0, 255, 255)     # amarillo: cajas elegidas antes de igualarlas
 COLOR_ENCONTRADA = (0, 255, 0)     # verde: caracteres elegidos (ya igualados)
 COLOR_PROYECTADA = (0, 165, 255)   # naranja: caracteres deducidos
+COLOR_PLACA = (0, 0, 255)          # rojo: placa segmentada
 COLOR_CENTROS, COLOR_TECHO, COLOR_PISO = (0, 0, 255), (255, 255, 0), (255, 0, 255)  # rectas (BGR)
 
 
@@ -532,26 +615,35 @@ def _pt(x, y, factor):
     return int(round(x * factor)), int(round(y * factor))
 
 
-def _poligono(vis, esq, color, factor):
-    cv2.polylines(vis, [np.array([_pt(x, y, factor) for x, y in esq], np.int32)], True, color, 1)
+def _poligono(vis, esq, color, factor, grosor=1):
+    cv2.polylines(vis, [np.array([_pt(x, y, factor) for x, y in esq], np.int32)], True, color, grosor)
 
 
 def ver_foto(ruta: str, factor: int = 6, guardar: Optional[str] = None):
     """Una figura (una pestaña/ventana) para UNA foto.
 
-    Fila de arriba (3 paneles):
+    Fila de arriba (4 paneles):
+      0) la foto original con la zona recortada (rojo) y el centro de la patente encontrado,
       1) el recorte de la patente con las cajas DETECTADAS (verde),
       2) el mismo recorte con las rectas (50% blanca, centros roja, techo celeste, piso magenta)
          y las cajas PROYECTADAS (naranja); si ya hay 6 detectadas no hay nada que proyectar,
-      3) el recorte GIRADO con las cajas finales ya giradas (verde = detectada, naranja = proyectada).
+      3) el recorte GIRADO con las cajas finales ya giradas (verde = detectada, naranja = proyectada)
+         y la PLACA segmentada (rojo).
     Filas de abajo: cada carácter recortado de la imagen girada, de izquierda a derecha
     (en grises y en binario), con su tipo (detectada/proyectada) y sus valores (x, y, ancho x alto).
 
     Si se indica `guardar` (ruta de archivo), se guarda la figura en vez de dejarla abierta.
     """
     r = analizar_foto(ruta)
+    informar(ruta, r)
     alto, ancho = r.binaria.shape
     g = r.giro
+
+    # --- panel 0: foto original con la zona recortada (etapa 1)
+    vis0 = cv2.imread(ruta, cv2.IMREAD_COLOR)
+    x0, y0, cw, ch = zona_recorte(vis0, r.punto)
+    cv2.rectangle(vis0, (x0, y0), (x0 + cw, y0 + ch), COLOR_PLACA, 2)
+    cv2.circle(vis0, r.punto, 3, COLOR_PLACA, -1)
 
     # --- panel 1: recorte con las cajas detectadas
     vis1 = _ampliar(r.recorte, factor)
@@ -585,6 +677,8 @@ def ver_foto(ruta: str, factor: int = 6, guardar: Optional[str] = None):
         for x0, y0, x1, y1, tipo in g.cajas_giradas:
             color = COLOR_PROYECTADA if tipo == "proyectada" else COLOR_ENCONTRADA
             _poligono(vis3, esquinas(x0, y0, x1, y1), color, factor)
+        if r.placa is not None:
+            _poligono(vis3, esquinas(*r.placa), COLOR_PLACA, factor, grosor=3)
 
     # --- cajas con las que se recorta cada carácter: de la imagen girada si hay giro
     if g is not None:
@@ -595,10 +689,11 @@ def ver_foto(ruta: str, factor: int = 6, guardar: Optional[str] = None):
         origen = "recorte sin girar"
 
     # --- figura
-    fig = plt.figure(figsize=(14, 7.5))
+    fig = plt.figure(figsize=(16, 7.5))
     if fig.canvas.manager is not None:
         fig.canvas.manager.set_window_title(ruta)                       # título de la pestaña/ventana
-    gs = fig.add_gridspec(3, N_CARACTERES, height_ratios=[1.15, 1, 1])
+    # 12 columnas: arriba 4 paneles de 3 columnas; abajo 6 caracteres de 2 columnas
+    gs = fig.add_gridspec(3, 12, height_ratios=[1.15, 1, 1])
 
     def panel(spec, img, titulo, fs=10):
         ax = fig.add_subplot(spec)
@@ -609,12 +704,13 @@ def ver_foto(ruta: str, factor: int = 6, guardar: Optional[str] = None):
         ax.set_title(titulo, fontsize=fs); ax.axis("off")
 
     ang = f"{g.angulo:+.1f}°" if g is not None else "-"
-    panel(gs[0, 0:2], vis1, f"{len(r.encontradas)} cajas detectadas")
-    panel(gs[0, 2:4], vis2, resumen, 9)
-    panel(gs[0, 4:6], vis3, f"girado {ang}: cajas finales")
+    panel(gs[0, 0:3], vis0, "foto: zona recortada (rojo)")
+    panel(gs[0, 3:6], vis1, f"{len(r.encontradas)} cajas detectadas")
+    panel(gs[0, 6:9], vis2, resumen, 9)
+    panel(gs[0, 9:12], vis3, f"girado {ang}: cajas finales y placa (rojo)")
 
     for j in range(N_CARACTERES):
-        ax_g, ax_b = fig.add_subplot(gs[1, j]), fig.add_subplot(gs[2, j])
+        ax_g, ax_b = fig.add_subplot(gs[1, 2 * j:2 * j + 2]), fig.add_subplot(gs[2, 2 * j:2 * j + 2])
         ax_g.axis("off"); ax_b.axis("off")
         if j >= len(cajas):
             continue                                                    # menos de 6 cajas: dejar vacío

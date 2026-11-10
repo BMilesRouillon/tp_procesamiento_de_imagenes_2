@@ -247,6 +247,22 @@ else:
     assert abs(ref_py.giro.angulo - angulo) < 1e-9 and np.allclose(ref_py.giro.centros_girados, centros_g), \
         "el paso a paso no coincide con analizar_recorte()"
 
+    # ============================================================
+    # ETAPA 5: SEGMENTAR LA PLACA (la caja negra), partiendo de la fila de caracteres
+    # ============================================================
+    oscuro_rot = estirado_rot <= p.UMBRAL_BINARIO
+    mostrar(ampliar(np.uint8(oscuro_rot) * 255), "píxeles oscuros del recorte girado (blanco = oscuro)")
+
+    placa = p.segmentar_placa(oscuro_rot, cajas_g)
+    vis = ampliar(rotado)
+    for x_a, y_a, x_b, y_b, tipo in cajas_g:
+        poligono(vis, p.esquinas(x_a, y_a, x_b, y_b), color_de(tipo))
+    cv2.polylines(vis, [np.array([(int(x * FACTOR), int(y * FACTOR)) for x, y in p.esquinas(*placa)], np.int32)],
+                  True, p.COLOR_PLACA, 3)
+    mostrar(vis, f"placa segmentada (rojo): se agranda la fila de caracteres mientras siga siendo oscuro "
+                 f"({placa[2] - placa[0]}x{placa[3] - placa[1]} px)")
+    assert placa == ref_py.placa, "el paso a paso no coincide con analizar_recorte()"
+
     # ------------------------------------------------------------
     # CADA CARÁCTER POR SEPARADO, RECORTADO DE LA IMAGEN GIRADA
     # ------------------------------------------------------------

@@ -8,7 +8,9 @@ Pipeline (cada etapa informa por consola y muestra una figura):
         2. Pasaje a CIELAB: canal L (brillo) y croma (saturación del color).
         3. Binarización: croma alto (monedas doradas/bimetálicas)
                          o brillo alto (monedas plateadas y dados).
-                         El umbral de brillo lo elige Otsu (U3).
+                         Los umbrales se miden en el borde de la foto, donde
+                         solo hay fondo: objeto = más color o más brillo que
+                         cualquier punto del fondo.
         4. Morfología: clausura, relleno de huecos (floodFill) y apertura.
         5. Componentes conectados: un objeto por moneda o dado.
 
@@ -47,9 +49,8 @@ CARPETA_SALIDA = 'images/output/'
 
 # --- Segmentación ------------------------------------------------------------
 SIGMA_SUAVIZADO = 2        # Desvío del filtro gaussiano
-UMBRAL_CROMA = 4           # Croma > umbral  -> objeto con color (el fondo es gris)
-LIMITE_CLARO = 150         # Otsu se calcula solo con los píxeles L > límite (el fondo oscuro no cuenta)
-K_CLAUSURA = 31            # Elemento estructurante de la clausura (tapa grietas)
+ANCHO_BORDE = 50           # Franja del borde de la foto (px) donde solo hay fondo: de ahí salen los umbrales
+K_CLAUSURA = 31           # Elemento estructurante de la clausura (tapa grietas)
 K_APERTURA = 61            # Elemento estructurante de la apertura (saca ruido)
 
 # --- Clasificación de monedas ------------------------------------------------
@@ -88,6 +89,17 @@ def rellenar_huecos(binaria):
     mascara = np.zeros((binaria.shape[0] + 2, binaria.shape[1] + 2), np.uint8)
     cv2.floodFill(inundada, mascara, (0, 0), 255)
     return binaria | cv2.bitwise_not(inundada)
+
+
+def maximo_en_borde(canal):
+    """
+    Valor más alto de un canal en el borde de la foto (franja de ANCHO_BORDE px).
+    En el borde no hay monedas ni dados: es el máximo que alcanza el FONDO.
+    """
+    b = ANCHO_BORDE
+    borde = np.concatenate([canal[:b].ravel(), canal[-b:].ravel(),        # arriba y abajo
+                            canal[:, :b].ravel(), canal[:, -b:].ravel()])  # izquierda y derecha
+    return borde.max()
 
 
 def medidas_contorno(obj):
@@ -150,12 +162,12 @@ def segmentar(img_rgb):
     # --- 3. Binarización ------------------------------------------------------
     # Monedas doradas y bimetálicas: croma alto.
     # Monedas plateadas y dados: casi sin color, pero muy claros.
-    # El umbral de brillo lo calcula Otsu, pero solo con los píxeles claros: si
-    # se usara toda la imagen, el fondo (que se aclara hacia la derecha) quedaría
-    # mezclado con los objetos.
-    umbral_brillo, _ = cv2.threshold(L[L > LIMITE_CLARO].reshape(-1, 1), 0, 255,
-                                     cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    bin_croma = (croma > UMBRAL_CROMA).astype(np.uint8) * 255
+    # Los dos umbrales se miden en el borde de la foto, donde solo hay fondo:
+    # un píxel es objeto si tiene más color o más brillo que el fondo en
+    # cualquier lugar (también en la parte derecha, que es la más clara).
+    umbral_croma = maximo_en_borde(croma)
+    umbral_brillo = maximo_en_borde(L)
+    bin_croma = (croma > umbral_croma).astype(np.uint8) * 255
     bin_brillo = (L > umbral_brillo).astype(np.uint8) * 255
     binaria = cv2.bitwise_or(bin_croma, bin_brillo)
 
@@ -165,7 +177,7 @@ def segmentar(img_rgb):
     mascara = cv2.morphologyEx(rellena, cv2.MORPH_OPEN, elemento(K_APERTURA))
 
     etapas = {
-        'L': L, 'croma': croma, 'umbral_brillo': umbral_brillo,
+        'L': L, 'croma': croma, 'umbral_croma': umbral_croma, 'umbral_brillo': umbral_brillo,
         'bin_croma': bin_croma, 'bin_brillo': bin_brillo, 'binaria': binaria,
         'clausura': clausura, 'rellena': rellena, 'mascara': mascara,
     }
@@ -287,10 +299,12 @@ def main():
     mostrar([img, e['L'], e['croma']],
             ['Imagen original', 'Canal L (brillo)', 'Croma (color)'],
             'A1_canales.png', 'A1. Pasaje a CIELAB: el croma ignora el degradé del fondo')
-    print(f"Binarización: croma > {UMBRAL_CROMA} o L > {e['umbral_brillo']:.0f} (umbral de brillo por Otsu)")
+    print(f"Binarización: croma > {e['umbral_croma']:.1f} o L > {e['umbral_brillo']:.0f} "
+          f"(máximos del fondo, medidos en el borde de la foto)")
 
     mostrar([e['bin_croma'], e['bin_brillo'], e['binaria']],
-            [f'Croma > {UMBRAL_CROMA}', f"L > {e['umbral_brillo']:.0f} (Otsu)", 'Unión (OR)'],
+            [f"Croma > {e['umbral_croma']:.1f} (máx. del fondo)",
+             f"L > {e['umbral_brillo']:.0f} (máx. del fondo)", 'Unión (OR)'],
             'A2_binarizacion.png', 'A2. Binarización')
 
     mostrar([e['clausura'], e['rellena'], mascara],
@@ -316,6 +330,9 @@ def main():
     print(f"{'Obj':>3} {'Área':>8} {'Perím.':>8} {'rho':>6}  Tipo")
     monedas = [o for o in objetos if o['rho'] > RHO_MIN_MONEDA]
     dados = [o for o in objetos if o['rho'] <= RHO_MIN_MONEDA]
+    if len(monedas) < len(CLAVES_MONEDAS):
+        raise ValueError(f'Solo se encontraron {len(monedas)} monedas: k-means necesita al menos '
+                         f'{len(CLAVES_MONEDAS)}. Revisar la segmentación (figuras A2 y A3).')
     centros, umbrales = clasificar_monedas(monedas)   # k-means sobre las áreas
     print(f"Centros de los grupos de área (k-means): {[round(float(c)) for c in centros]}")
     for o in objetos:
