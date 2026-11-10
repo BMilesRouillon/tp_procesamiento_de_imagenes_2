@@ -1,0 +1,13 @@
+foto,estado_original,angulo,metodo,version,cajas,leida,real,aciertos
+img01,proyectado,-7,consenso,V/tophat7,6,BOF817,BUF817,5
+img02,completo,-9,consenso,gris/umbral110,6,GXQ796,GXQ798,5
+img03,proyectado,-13,geometria,gris/umbral110,6,DMH024,DMH024,6
+img04,completo,-14,consenso,gris/tophat9,6,LNE988,LHE986,4
+img05,completo,-10,consenso,gris/umbral110,6,FJY344,FJY344,6
+img06,completo,-8,consenso,gris/tophat7,6,LEH992,LEH992,6
+img07,completo,+0,consenso,gris/umbral110,6,LOD123,LOD123,6
+img08,completo,-8,consenso,gris/umbral127,6,JNO337,JMO337,5
+img09,completo,+0,consenso,L/umbral127,6,FFO765,FFD765,5
+img10,completo,-5,consenso,gris/umbral150,6,OOD322,DOA322,4
+img11,proyectado,-9,consenso,gris/umbral150,6,GMO569,GMQ569,5
+img12,completo,-5,consenso,gris/umbral127,6,BQX387,BQX387,6
