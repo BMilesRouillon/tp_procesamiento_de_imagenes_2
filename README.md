@@ -1,6 +1,6 @@
 # Procesamiento de Imágenes — Trabajo Práctico N.º 2
 
-Implementación en Python de técnicas de procesamiento de imágenes para la materia **Procesamiento de Imágenes I — Tecnicatura Universitaria en Inteligencia Artificial, UNR (2.º semestre 2025)**.
+Implementación en Python de técnicas de procesamiento de imágenes para la materia **Procesamiento de Imágenes I — Tecnicatura Universitaria en Inteligencia Artificial, Universidad Austral Rosario (2.º semestre 2026)**.
 
 El trabajo aborda dos problemas:
 
