@@ -15,6 +15,11 @@ El flujo completo tiene 3 etapas (cada una es una sección de este archivo):
      usando la geometría de la patente (alineación, separación constante,
      mitad izquierda/derecha).
         cajas_de_area_similar()  ->  igualar_cajas()  ->  proyectar_lado()
+  4) ENDEREZAR: con las cajas ya definidas, se mide la inclinación de la patente (recta por los
+     centros de la primera y la última caja), se GIRA el recorte y, con la MISMA matriz, se giran
+     las cajas. Los caracteres se recortan de la imagen girada (fila horizontal).
+        calcular_giro()  ->  girar()
+     La detección de las etapas 2 y 3 se hace SIN rotar: el giro no puede empeorarla.
 
 Punto de entrada:   analizar_foto(ruta)   -> Resultado
 Para verlo:         python patentes.py     (abre una ventana/pestaña por foto)
@@ -61,6 +66,11 @@ CONECTIVIDAD = 4      # 4: solo vecinos arriba/abajo/izq/der; 8: también diagon
 TOL_AREA = 0.25       # dos cajas son "parecidas" si sus áreas difieren menos de 25% (relativo)
 N_CARACTERES = 6
 MARGEN_PROYECCION = 1.5   # ver proyectar_lado()
+
+# --- Etapa 4: enderezado ---
+ROTAR = True                              # False: no girar (el Resultado queda sin imagen girada)
+GIRO_INTERPOLACION = cv2.INTER_CUBIC      # interpolación al girar la imagen (no afecta a la detección)
+GIRO_BORDE = cv2.BORDER_REPLICATE         # relleno de los bordes que quedan vacíos al girar
 
 
 # ============================================================
@@ -112,6 +122,10 @@ class Resultado:
     pendiente: Optional[float] = None   # inclinación de la patente (dy/dx); None si no se pudo calcular
     proyectadas: List[Proyeccion] = field(default_factory=list)
     estado: str = "insuficiente"        # "completo" | "proyectado" | "insuficiente"
+    giro: Optional["Giro"] = None       # datos del giro (None si ROTAR=False o no hay >= 2 caracteres)
+    rotado: Optional[np.ndarray] = None            # recorte color girado
+    estirado_rotado: Optional[np.ndarray] = None   # recorte girado en grises (contraste estirado)
+    binaria_rotada: Optional[np.ndarray] = None    # el girado, binarizado con UMBRAL_BINARIO (solo para mostrar)
 
     def cajas_finales(self):
         """Todas las cajas de la patente (detectadas + proyectadas) como tuplas
@@ -119,6 +133,18 @@ class Resultado:
         cajas = [(c.x, c.y, c.x + c.w, c.y + c.h, "detectada") for c in self.encontradas]
         cajas += [(p.x0, p.y0, p.x1, p.y1, "proyectada") for p in self.proyectadas]
         return sorted(cajas)
+
+
+@dataclass
+class Giro:
+    """Giro que endereza la patente y lo que les pasa a las cajas cuando se gira la imagen."""
+    angulo: float                       # grados; > 0 = se gira en sentido antihorario (patente que baja hacia la derecha)
+    matriz: np.ndarray                  # matriz afín 2x3 del giro (la misma para la imagen y para las cajas)
+    cajas: list                         # cajas ANTES de girar: (x0, y0, x1, y1, tipo)
+    poligonos: list                     # esquinas de cada caja DESPUÉS de girar (array 4x2): cuadriláteros inclinados
+    centros: np.ndarray                 # (n, 2) centro de cada caja antes de girar
+    centros_girados: np.ndarray         # (n, 2) centro de cada caja después de girar
+    cajas_giradas: list                 # cajas rectas del mismo tamaño centradas en los centros girados (x0, y0, x1, y1, tipo)
 
 
 # ============================================================
@@ -368,18 +394,68 @@ def completar_caracteres(encontradas: List[Caja], ancho_recorte: int):
 
 
 # ============================================================
+# ETAPA 4: ENDEREZAR (GIRAR EL RECORTE Y LAS CAJAS)
+# ============================================================
+
+def angulo_por_centros(encontradas: List[Caja]) -> Optional[float]:
+    """Ángulo (grados) de la recta que une los centros de la primera y la última caja detectada.
+    Positivo = la fila baja hacia la derecha. None si hay menos de 2 cajas o están en la misma x."""
+    if len(encontradas) < 2:
+        return None
+    m = pendiente_entre(encontradas[0], encontradas[-1])
+    return None if m is None else float(np.degrees(np.arctan(m)))
+
+
+def matriz_giro(angulo: float, ancho: int, alto: int) -> np.ndarray:
+    """Matriz afín 2x3 de un giro de `angulo` grados alrededor del centro de una imagen ancho x alto.
+    Con angulo > 0 el giro es antihorario, que es lo que endereza una fila que baja hacia la derecha."""
+    return cv2.getRotationMatrix2D((ancho / 2, alto / 2), angulo, 1.0)
+
+
+def girar(img: np.ndarray, matriz: np.ndarray) -> np.ndarray:
+    """Aplica el giro a una imagen. Mantiene el tamaño; los bordes vacíos se rellenan con GIRO_BORDE."""
+    alto, ancho = img.shape[:2]
+    return cv2.warpAffine(img, matriz, (ancho, alto), flags=GIRO_INTERPOLACION, borderMode=GIRO_BORDE)
+
+
+def transformar_puntos(matriz: np.ndarray, puntos) -> np.ndarray:
+    """Lleva puntos (x, y) de la imagen original a la girada con la MISMA matriz que `girar`.
+    Devuelve un array (n, 2)."""
+    P = np.asarray(puntos, dtype=np.float64).reshape(-1, 2)
+    return P @ matriz[:, :2].T + matriz[:, 2]
+
+
+def esquinas(x0: float, y0: float, x1: float, y1: float) -> list:
+    """Esquinas de un rectángulo en orden: superior izquierda, superior derecha, inferior derecha, inferior izquierda."""
+    return [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+
+
+def calcular_giro(encontradas: List[Caja], cajas: list, ancho: int, alto: int) -> Optional[Giro]:
+    """Calcula el giro y la nueva posición de todas las cajas.
+
+    encontradas: las cajas DETECTADAS (de ellas sale el ángulo).
+    cajas: todas las cajas finales (detectadas + proyectadas) como (x0, y0, x1, y1, tipo).
+    Devuelve None si no se puede calcular el ángulo (menos de 2 cajas detectadas).
+    """
+    angulo = angulo_por_centros(encontradas)
+    if angulo is None or not cajas:
+        return None
+    M = matriz_giro(angulo, ancho, alto)
+    centros = np.array([((a + c) / 2, (b + d) / 2) for a, b, c, d, _ in cajas])
+    centros_g = transformar_puntos(M, centros)
+    poligonos = [transformar_puntos(M, esquinas(a, b, c, d)) for a, b, c, d, _ in cajas]
+    giradas = [(cx - (c - a) / 2, cy - (d - b) / 2, cx + (c - a) / 2, cy + (d - b) / 2, tipo)
+               for (a, b, c, d, tipo), (cx, cy) in zip(cajas, centros_g)]
+    return Giro(angulo, M, cajas, poligonos, centros, centros_g, giradas)
+
+
+# ============================================================
 # FUNCIÓN PRINCIPAL
 # ============================================================
 
-def analizar_foto(ruta: str) -> Resultado:
-    """Corre todo el flujo sobre una foto y devuelve un Resultado.
-
-    estado:
-      "completo"     -> se encontraron los 6 caracteres directamente.
-      "proyectado"   -> faltaban; se dedujo la posición de los que faltan (ver `proyectadas`).
-      "insuficiente" -> muy pocos caracteres para deducir algo.
-    """
-    recorte, estirado, binaria = preparar_foto(ruta)
+def analizar_recorte(recorte: np.ndarray) -> Resultado:
+    """Etapas 2, 3 y 4 sobre un recorte ya extraído (la detección se hace SIN rotar)."""
+    estirado, binaria = preparar_binaria(recorte)
     candidatas = componentes(binaria)
     originales = cajas_de_area_similar(candidatas)
     encontradas = igualar_cajas(originales)
@@ -390,7 +466,30 @@ def analizar_foto(ruta: str) -> Resultado:
     elif len(encontradas) >= 2:
         res.pendiente, res.proyectadas = completar_caracteres(encontradas, binaria.shape[1])
         res.estado = "proyectado" if res.proyectadas else "insuficiente"
+
+    # Etapa 4: con las cajas ya definidas, girar el recorte y las cajas con la misma matriz
+    if ROTAR:
+        alto, ancho = binaria.shape
+        res.giro = calcular_giro(encontradas, res.cajas_finales(), ancho, alto)
+        if res.giro is not None:
+            res.rotado = girar(recorte, res.giro.matriz)
+            res.estirado_rotado = girar(estirado, res.giro.matriz)
+            res.binaria_rotada = np.where(res.estirado_rotado > UMBRAL_BINARIO, 255, 0).astype(np.uint8)
     return res
+
+
+def analizar_foto(ruta: str) -> Resultado:
+    """Corre todo el flujo sobre una foto y devuelve un Resultado.
+
+    estado:
+      "completo"     -> se encontraron los 6 caracteres directamente.
+      "proyectado"   -> faltaban; se dedujo la posición de los que faltan (ver `proyectadas`).
+      "insuficiente" -> muy pocos caracteres para deducir algo.
+    Si ROTAR=True y hay >= 2 caracteres detectados, `giro`, `rotado`, `estirado_rotado` y `binaria_rotada`
+    traen el recorte enderezado y las cajas giradas.
+    """
+    recorte, _, _ = preparar_foto(ruta)
+    return analizar_recorte(recorte)
 
 
 # ============================================================
@@ -428,61 +527,91 @@ def _rgb(vis):
     return cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
 
 
+def _pt(x, y, factor):
+    """Coordenadas del recorte -> píxeles de la imagen ampliada."""
+    return int(round(x * factor)), int(round(y * factor))
+
+
+def _poligono(vis, esq, color, factor):
+    cv2.polylines(vis, [np.array([_pt(x, y, factor) for x, y in esq], np.int32)], True, color, 1)
+
+
 def ver_foto(ruta: str, factor: int = 6, guardar: Optional[str] = None):
     """Una figura (una pestaña/ventana) para UNA foto.
 
     Fila de arriba (3 paneles):
-      1) el recorte de la patente,
-      2) la binaria con todas las candidatas (celeste),
-      3) el resultado: cajas originales (amarillo), igualadas (verde), línea del 50% (blanca),
-         rectas de centros (roja), techo (celeste) y piso (magenta), cajas deducidas (naranja).
-    Filas de abajo: cada carácter por separado, de izquierda a derecha (en grises y en binario),
-    con su tipo (detectada/proyectada) y sus valores (x, y, ancho x alto) dentro del recorte.
+      1) el recorte de la patente con las cajas DETECTADAS (verde),
+      2) el mismo recorte con las rectas (50% blanca, centros roja, techo celeste, piso magenta)
+         y las cajas PROYECTADAS (naranja); si ya hay 6 detectadas no hay nada que proyectar,
+      3) el recorte GIRADO con las cajas finales ya giradas (verde = detectada, naranja = proyectada).
+    Filas de abajo: cada carácter recortado de la imagen girada, de izquierda a derecha
+    (en grises y en binario), con su tipo (detectada/proyectada) y sus valores (x, y, ancho x alto).
 
     Si se indica `guardar` (ruta de archivo), se guarda la figura en vez de dejarla abierta.
     """
     r = analizar_foto(ruta)
     alto, ancho = r.binaria.shape
+    g = r.giro
 
-    # --- panel 2: binaria con candidatas
-    vis_bin = _ampliar(r.binaria, factor)
-    for c in r.candidatas:
-        _dibujar_caja(vis_bin, c, COLOR_CANDIDATA, factor)
-
-    # --- panel 3: resultado
-    vis = _ampliar(r.estirado, factor)
-    for c in r.originales:
-        _dibujar_caja(vis, c, COLOR_ORIGINAL, factor)
+    # --- panel 1: recorte con las cajas detectadas
+    vis1 = _ampliar(r.recorte, factor)
     for c in r.encontradas:
-        _dibujar_caja(vis, c, COLOR_ENCONTRADA, factor)
+        _dibujar_caja(vis1, c, COLOR_ENCONTRADA, factor)
 
+    # --- panel 2: rectas y cajas proyectadas
+    vis2 = _ampliar(r.recorte, factor)
+    for c in r.encontradas:
+        _dibujar_caja(vis2, c, COLOR_ENCONTRADA, factor)
     if r.estado == "completo":
-        resumen = f"{N_CARACTERES} detectadas -> listo"
+        resumen = f"{N_CARACTERES} detectadas: no hace falta proyectar"
     elif r.estado == "insuficiente":
         resumen = f"{len(r.encontradas)} detectadas: no alcanza para deducir"
     else:
         mitad = ancho / 2
-        cv2.line(vis, (int(mitad * factor), 0), (int(mitad * factor), alto * factor), (255, 255, 255), 1)
+        cv2.line(vis2, (int(mitad * factor), 0), (int(mitad * factor), alto * factor), (255, 255, 255), 1)
         ref = r.encontradas[0]
-        _trazar_recta(vis, (ref.cx, ref.cy), r.pendiente, ancho, factor, COLOR_CENTROS)
-        _trazar_recta(vis, (ref.x, ref.y), r.pendiente, ancho, factor, COLOR_TECHO)
-        _trazar_recta(vis, (ref.x + ref.w, ref.y + ref.h), r.pendiente, ancho, factor, COLOR_PISO)
-        for p in r.proyectadas:
-            cv2.rectangle(vis, (int(p.x0 * factor), int(p.y0 * factor)),
-                          (int(p.x1 * factor), int(p.y1 * factor)), COLOR_PROYECTADA, 1)
-        resumen = f"{len(r.encontradas)} detectadas | " + " | ".join(
-            f"{p.lado}: falta {p.motivo}" for p in r.proyectadas)
+        _trazar_recta(vis2, (ref.cx, ref.cy), r.pendiente, ancho, factor, COLOR_CENTROS)
+        _trazar_recta(vis2, (ref.x, ref.y), r.pendiente, ancho, factor, COLOR_TECHO)
+        _trazar_recta(vis2, (ref.x + ref.w, ref.y + ref.h), r.pendiente, ancho, factor, COLOR_PISO)
+        for q in r.proyectadas:
+            cv2.rectangle(vis2, (int(q.x0 * factor), int(q.y0 * factor)),
+                          (int(q.x1 * factor), int(q.y1 * factor)), COLOR_PROYECTADA, 1)
+        resumen = " | ".join(f"{q.lado}: falta {q.motivo}" for q in r.proyectadas) or "ninguna mitad con 2 caracteres"
+
+    # --- panel 3: recorte girado con las cajas finales giradas
+    vis3 = None
+    if g is not None:
+        vis3 = _ampliar(r.rotado, factor)
+        for x0, y0, x1, y1, tipo in g.cajas_giradas:
+            color = COLOR_PROYECTADA if tipo == "proyectada" else COLOR_ENCONTRADA
+            _poligono(vis3, esquinas(x0, y0, x1, y1), color, factor)
+
+    # --- cajas con las que se recorta cada carácter: de la imagen girada si hay giro
+    if g is not None:
+        cajas, gris_ch, bin_ch = g.cajas_giradas, r.estirado_rotado, r.binaria_rotada
+        origen = "imagen girada"
+    else:
+        cajas, gris_ch, bin_ch = r.cajas_finales(), r.estirado, r.binaria
+        origen = "recorte sin girar"
 
     # --- figura
-    cajas = r.cajas_finales()
     fig = plt.figure(figsize=(14, 7.5))
     if fig.canvas.manager is not None:
         fig.canvas.manager.set_window_title(ruta)                       # título de la pestaña/ventana
     gs = fig.add_gridspec(3, N_CARACTERES, height_ratios=[1.15, 1, 1])
 
-    ax = fig.add_subplot(gs[0, 0:2]); ax.imshow(_rgb(r.recorte)); ax.set_title("recorte de la patente", fontsize=11); ax.axis("off")
-    ax = fig.add_subplot(gs[0, 2:4]); ax.imshow(_rgb(vis_bin)); ax.set_title(f"{len(r.candidatas)} candidatas", fontsize=11); ax.axis("off")
-    ax = fig.add_subplot(gs[0, 4:6]); ax.imshow(_rgb(vis)); ax.set_title(resumen, fontsize=9); ax.axis("off")
+    def panel(spec, img, titulo, fs=10):
+        ax = fig.add_subplot(spec)
+        if img is None:
+            ax.text(0.5, 0.5, "sin giro", ha="center", va="center")
+        else:
+            ax.imshow(_rgb(img))
+        ax.set_title(titulo, fontsize=fs); ax.axis("off")
+
+    ang = f"{g.angulo:+.1f}°" if g is not None else "-"
+    panel(gs[0, 0:2], vis1, f"{len(r.encontradas)} cajas detectadas")
+    panel(gs[0, 2:4], vis2, resumen, 9)
+    panel(gs[0, 4:6], vis3, f"girado {ang}: cajas finales")
 
     for j in range(N_CARACTERES):
         ax_g, ax_b = fig.add_subplot(gs[1, j]), fig.add_subplot(gs[2, j])
@@ -492,12 +621,12 @@ def ver_foto(ruta: str, factor: int = 6, guardar: Optional[str] = None):
         x0, y0, x1, y1, tipo = cajas[j]
         a, b = max(0, int(round(x0))), max(0, int(round(y0)))           # recortar sin salirse del recorte
         c, d = min(ancho, int(round(x1))), min(alto, int(round(y1)))
-        ax_g.imshow(r.estirado[b:d, a:c], cmap="gray", vmin=0, vmax=255)
-        ax_b.imshow(r.binaria[b:d, a:c], cmap="gray", vmin=0, vmax=255)
+        ax_g.imshow(gris_ch[b:d, a:c], cmap="gray", vmin=0, vmax=255)
+        ax_b.imshow(bin_ch[b:d, a:c], cmap="gray", vmin=0, vmax=255)
         ax_g.set_title(f"{j + 1}: {tipo}\nx={a} y={b}  {c - a}x{d - b}", fontsize=9,
                        color="darkorange" if tipo == "proyectada" else "black")
 
-    fig.suptitle(f"{ruta[-9:]}  -  estado: {r.estado}", fontsize=13)
+    fig.suptitle(f"{ruta[-9:]}  -  estado: {r.estado}  -  caracteres de la {origen}", fontsize=13)
     fig.tight_layout()
     if guardar:
         fig.savefig(guardar, dpi=100)
@@ -520,5 +649,6 @@ def ver_resultados(rutas: List[str], factor: int = 6, guardar_prefijo: Optional[
 # ============================================================
 
 if __name__ == "__main__":
-    rutas_fotos = sys.argv[1:] or [f"tp2_procesamiento_de_imagenes/images/Patentes/img{i:02d}.png" for i in range(1, 13)]
+    # rutas_fotos = sys.argv[1:] or [f"images/Patentes/img{i:02d}.png" for i in range(1, 13)]
+    rutas_fotos = sys.argv[1:] or [f"images/Patentes/img{i:02d}.png" for i in range(1, 13)]
     ver_resultados(rutas_fotos)

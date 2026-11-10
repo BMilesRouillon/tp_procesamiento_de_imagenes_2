@@ -8,21 +8,26 @@ Pipeline (cada etapa informa por consola y muestra una figura):
         2. Pasaje a CIELAB: canal L (brillo) y croma (saturación del color).
         3. Binarización: croma alto (monedas doradas/bimetálicas)
                          o brillo alto (monedas plateadas y dados).
+                         El umbral de brillo lo elige Otsu (U3).
         4. Morfología: clausura, relleno de huecos (floodFill) y apertura.
         5. Componentes conectados: un objeto por moneda o dado.
 
     B. Clasificación de monedas
         6. Contorno, área y perímetro de cada objeto -> factor de forma rho.
            rho alto = círculo = moneda;  rho bajo = dado.
-        7. Las monedas se clasifican por ÁREA (10 centavos / 1 peso / 50 centavos).
+        7. Las monedas se clasifican por ÁREA con k-means (U5): se agrupan las
+           áreas en 3 grupos (10 centavos / 1 peso / 50 centavos) sin umbrales fijos.
 
     C. Dados
-        8. Dentro de cada dado se buscan los puntos negros (pips).
+        8. Dentro de cada dado se buscan los puntos negros (pips) y se tapan los
+           agujeritos de los reflejos con una clausura (U6).
         9. Los pips de la cara superior son círculos grandes (área alta y
            rho alto); los de las caras laterales están estirados y son chicos.
+           "Grande" se mide contra el pip más grande de ese mismo dado.
            El valor del dado es la cantidad de pips de la cara superior.
 
-Uso:  python problema_1.py   (desde cualquier carpeta)
+Uso:  python problema_1.py   (desde la carpeta del proyecto)
+Las figuras se guardan en images/output/
 """
 
 import os
@@ -43,19 +48,19 @@ CARPETA_SALIDA = 'images/output/'
 # --- Segmentación ------------------------------------------------------------
 SIGMA_SUAVIZADO = 2        # Desvío del filtro gaussiano
 UMBRAL_CROMA = 4           # Croma > umbral  -> objeto con color (el fondo es gris)
-UMBRAL_BRILLO = 190        # L > umbral      -> objeto muy claro (plateadas y dados)
+LIMITE_CLARO = 150         # Otsu se calcula solo con los píxeles L > límite (el fondo oscuro no cuenta)
 K_CLAUSURA = 31            # Elemento estructurante de la clausura (tapa grietas)
 K_APERTURA = 61            # Elemento estructurante de la apertura (saca ruido)
 
 # --- Clasificación de monedas ------------------------------------------------
 RHO_MIN_MONEDA = 0.8       # rho > 0.8 -> moneda (círculo);  rho <= 0.8 -> dado
 # Áreas medidas (px): 10c ~ 55k-63k | 1 peso ~ 84k-87k | 50c ~ 105k
-AREA_MAX_10C = 70000       # area < 70000            -> 10 centavos
-AREA_MAX_1PESO = 95000     # 70000 <= area < 95000   -> 1 peso ; sino -> 50 centavos
+CLAVES_MONEDAS = ['10c', '1p', '50c']   # De menor a mayor área (k-means usa 3 grupos)
 
 # --- Dados -------------------------------------------------------------------
 K_APERTURA_PIPS = 5        # Apertura para limpiar los puntos negros
-AREA_MIN_PIP = 1000        # Los pips de la cara superior son grandes (~1600-2200 px)
+K_CLAUSURA_PIPS = 15       # Clausura para tapar los reflejos y mordidas dentro de un pip
+FRAC_AREA_PIP = 0.5        # Un pip de la cara superior mide al menos esta fracción del pip más grande
 RHO_MIN_PIP = 0.65         # ... y circulares (los de las caras laterales estan estirados)
 
 MONEDAS = {
@@ -145,8 +150,13 @@ def segmentar(img_rgb):
     # --- 3. Binarización ------------------------------------------------------
     # Monedas doradas y bimetálicas: croma alto.
     # Monedas plateadas y dados: casi sin color, pero muy claros.
+    # El umbral de brillo lo calcula Otsu, pero solo con los píxeles claros: si
+    # se usara toda la imagen, el fondo (que se aclara hacia la derecha) quedaría
+    # mezclado con los objetos.
+    umbral_brillo, _ = cv2.threshold(L[L > LIMITE_CLARO].reshape(-1, 1), 0, 255,
+                                     cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     bin_croma = (croma > UMBRAL_CROMA).astype(np.uint8) * 255
-    bin_brillo = (L > UMBRAL_BRILLO).astype(np.uint8) * 255
+    bin_brillo = (L > umbral_brillo).astype(np.uint8) * 255
     binaria = cv2.bitwise_or(bin_croma, bin_brillo)
 
     # --- 4. Morfología --------------------------------------------------------
@@ -155,7 +165,7 @@ def segmentar(img_rgb):
     mascara = cv2.morphologyEx(rellena, cv2.MORPH_OPEN, elemento(K_APERTURA))
 
     etapas = {
-        'L': L, 'croma': croma,
+        'L': L, 'croma': croma, 'umbral_brillo': umbral_brillo,
         'bin_croma': bin_croma, 'bin_brillo': bin_brillo, 'binaria': binaria,
         'clausura': clausura, 'rellena': rellena, 'mascara': mascara,
     }
@@ -179,13 +189,25 @@ def medir_objetos(labels, num_labels):
     return objetos
 
 
-def clasificar_moneda(area):
-    """Clasifica una moneda por su área."""
-    if area < AREA_MAX_10C:
-        return '10c'
-    if area < AREA_MAX_1PESO:
-        return '1p'
-    return '50c'
+def clasificar_monedas(monedas):
+    """
+    Clasifica las monedas por su área con k-means (3 grupos). Escribe o['tipo'] en
+    cada moneda y devuelve los centros de los grupos y los umbrales de corte
+    (punto medio entre grupos vecinos), solo para mostrarlos en el gráfico.
+    """
+    areas = np.float32([o['area'] for o in monedas]).reshape(-1, 1)
+    criterio = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.1)
+    cv2.setRNGSeed(0)   # misma corrida, mismo resultado
+    _, etiquetas, centros = cv2.kmeans(areas, len(CLAVES_MONEDAS), None, criterio, 10,
+                                       cv2.KMEANS_PP_CENTERS)
+    centros = centros.flatten()
+    orden = np.argsort(centros)             # grupo de menor a mayor área
+    posicion = np.empty_like(orden)
+    posicion[orden] = np.arange(len(orden))  # número de grupo -> posición (0=10c, 1=1p, 2=50c)
+    for o, e in zip(monedas, etiquetas.flatten()):
+        o['tipo'] = CLAVES_MONEDAS[posicion[e]]
+    centros = np.sort(centros)
+    return centros, (centros[:-1] + centros[1:]) / 2
 
 
 def dibujar_texto(img, texto, centro, color, escala=2.6, grosor=7):
@@ -221,13 +243,18 @@ def contar_pips(gris, dado):
     umbral, _ = cv2.threshold(valores, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     oscuros = ((gris < umbral) & (mascara > 0)).astype(np.uint8) * 255
     oscuros = cv2.morphologyEx(oscuros, cv2.MORPH_OPEN, elemento(K_APERTURA_PIPS))
+    # Clausura: tapa los reflejos blancos y las mordidas dentro de cada pip
+    oscuros = cv2.morphologyEx(oscuros, cv2.MORPH_CLOSE, elemento(K_CLAUSURA_PIPS))
 
-    # 3 y 4. Componentes conectados y filtro por área y factor de forma
+    # 3 y 4. Componentes conectados y filtro por área y factor de forma.
+    # El área mínima es relativa: una fracción del pip redondo más grande del dado.
     n, labels, _, _ = cv2.connectedComponentsWithStats(oscuros)
     candidatos = medir_objetos(labels, n)
+    redondos = [c['area'] for c in candidatos if c['rho'] > RHO_MIN_PIP]
+    area_min = FRAC_AREA_PIP * max(redondos, default=0)
     pips_top, descartados = [], []
     for c in candidatos:
-        if c['area'] > AREA_MIN_PIP and c['rho'] > RHO_MIN_PIP:
+        if c['area'] >= area_min and c['rho'] > RHO_MIN_PIP:
             pips_top.append(c)
         else:
             descartados.append(c)
@@ -260,10 +287,10 @@ def main():
     mostrar([img, e['L'], e['croma']],
             ['Imagen original', 'Canal L (brillo)', 'Croma (color)'],
             'A1_canales.png', 'A1. Pasaje a CIELAB: el croma ignora el degradé del fondo')
-    print(f"Binarización: croma > {UMBRAL_CROMA} o L > {UMBRAL_BRILLO}")
+    print(f"Binarización: croma > {UMBRAL_CROMA} o L > {e['umbral_brillo']:.0f} (umbral de brillo por Otsu)")
 
     mostrar([e['bin_croma'], e['bin_brillo'], e['binaria']],
-            [f'Croma > {UMBRAL_CROMA}', f'L > {UMBRAL_BRILLO}', 'Unión (OR)'],
+            [f'Croma > {UMBRAL_CROMA}', f"L > {e['umbral_brillo']:.0f} (Otsu)", 'Unión (OR)'],
             'A2_binarizacion.png', 'A2. Binarización')
 
     mostrar([e['clausura'], e['rellena'], mascara],
@@ -287,15 +314,12 @@ def main():
     objetos = medir_objetos(labels, num_labels)
 
     print(f"{'Obj':>3} {'Área':>8} {'Perím.':>8} {'rho':>6}  Tipo")
-    monedas, dados = [], []
+    monedas = [o for o in objetos if o['rho'] > RHO_MIN_MONEDA]
+    dados = [o for o in objetos if o['rho'] <= RHO_MIN_MONEDA]
+    centros, umbrales = clasificar_monedas(monedas)   # k-means sobre las áreas
+    print(f"Centros de los grupos de área (k-means): {[round(float(c)) for c in centros]}")
     for o in objetos:
-        if o['rho'] > RHO_MIN_MONEDA:
-            o['tipo'] = clasificar_moneda(o['area'])
-            monedas.append(o)
-            tipo = MONEDAS[o['tipo']]['nombre']
-        else:
-            dados.append(o)
-            tipo = 'DADO'
+        tipo = MONEDAS[o['tipo']]['nombre'] if o in monedas else 'DADO'
         print(f"{o['id']:>3} {o['area']:>8.0f} {o['perimetro']:>8.0f} {o['rho']:>6.3f}  {tipo}")
 
     img_monedas = img.copy()
@@ -320,10 +344,10 @@ def main():
     for clave, m in MONEDAS.items():
         areas = [o['area'] for o in monedas if o['tipo'] == clave]
         ax.scatter(areas, [m['nombre']] * len(areas), color=np.array(m['color']) / 255, s=80)
-    ax.axvline(AREA_MAX_10C, color='gray', ls='--')
-    ax.axvline(AREA_MAX_1PESO, color='gray', ls='--')
+    for umbral in umbrales:   # corte entre grupos vecinos (punto medio de los centros)
+        ax.axvline(umbral, color='gray', ls='--')
     ax.set_xlabel('Área (px)')
-    ax.set_title('B1. Área de cada moneda y umbrales de clasificación')
+    ax.set_title('B1. Área de cada moneda y cortes de los grupos (k-means)')
     plt.tight_layout()
     fig.savefig(os.path.join(CARPETA_SALIDA, 'B1_areas.png'), dpi=150, bbox_inches='tight')
     plt.show(block=False)
