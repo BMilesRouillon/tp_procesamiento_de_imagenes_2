@@ -190,7 +190,7 @@ def firma_contornos(caracter, escala=6):
     g = cv2.resize(caracter, None, fx=escala, fy=escala, interpolation=cv2.INTER_CUBIC)
     g = cv2.threshold(cv2.copyMakeBorder(g, 4, 4, 4, 4, cv2.BORDER_CONSTANT, value=0), 127, 255, cv2.THRESH_BINARY)[1]
     H, W = g.shape
-    contornos, jerarquia = cv2.findContours(g, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    contornos, jerarquia = cv2.findContours(g, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
     alturas, externo = [], None
     for c, j in zip(contornos, jerarquia[0] if jerarquia is not None else []):
         if j[3] != -1:                                       # contorno dentro de otro = agujero
