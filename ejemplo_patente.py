@@ -1,9 +1,19 @@
+"""
+ejemplo_patente.py
+==================
+Paso a paso del Problema 2 sobre UNA foto: cada llamada a mostrar() abre un gráfico numerado
+que corresponde a un paso del algoritmo de problema_2.py (etapas 1 a 4).
+
+Uso:  python ejemplo_patente.py   (desde la carpeta del proyecto)
+Para analizar otra foto se cambia RUTA. La versión para Jupyter está en notebooks/ejemplo_patente.ipynb.
+"""
+
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import problema_2 as p
 
-RUTA = "tp_procesamiento_de_imagenes_2/images/Patentes/img02.png"
+RUTA = "images/Patentes/img02.png"
 FACTOR = 6
 
 # ------------------------------------------------------------
