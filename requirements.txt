@@ -1,0 +1,5 @@
+opencv-python
+numpy
+matplotlib
+# jupyter solo hace falta para notebooks/ejemplo_patente.ipynb
+jupyter
