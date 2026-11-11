@@ -1,6 +1,6 @@
 """
-patentes.py
-===========
+problema_2.py
+=============
 Localización y segmentación de los 6 caracteres de patentes argentinas (formato
 viejo: 3 letras + 3 números, caja negra con caracteres claros) en fotos de 640x360.
 
@@ -22,7 +22,7 @@ El flujo completo tiene 3 etapas (cada una es una sección de este archivo):
      La detección de las etapas 2 y 3 se hace SIN rotar: el giro no puede empeorarla.
 
 Punto de entrada:   analizar_foto(ruta)   -> Resultado
-Para verlo:         python patentes.py     (abre una ventana/pestaña por foto)
+Para verlo:         python problema_2.py   (informa por consola y abre una ventana/pestaña por foto)
                     ver_resultados(rutas)  (desde un notebook o un script)
 
 Convenciones
@@ -536,6 +536,25 @@ def _poligono(vis, esq, color, factor):
     cv2.polylines(vis, [np.array([_pt(x, y, factor) for x, y in esq], np.int32)], True, color, 1)
 
 
+def informar(ruta: str, r: Resultado):
+    """Imprime por consola el resultado de cada etapa para una foto."""
+    alto, ancho = r.recorte.shape[:2]
+    print(f"\n=== {ruta[-9:]} ===")
+    print(f"Etapa 1 | Localización: recorte de {ancho}x{alto} px")
+    print(f"Etapa 2 | Binarización: {len(r.candidatas)} componentes candidatas a carácter")
+    linea = f"Etapa 3 | Selección: {len(r.encontradas)} cajas de área parecida"
+    if r.proyectadas:
+        n = len(r.proyectadas)
+        linea += f" + {n} deducida{'s' if n != 1 else ''} por geometría (" + "; ".join(
+            f"{q.lado}: {q.motivo}" for q in r.proyectadas) + ")"
+    print(linea)
+    if r.giro is not None:
+        print(f"Etapa 4 | Enderezado: giro de {r.giro.angulo:+.1f}°")
+    else:
+        print("Etapa 4 | Enderezado: sin giro (hacen falta al menos 2 caracteres detectados)")
+    print(f"Resultado: {r.estado} ({len(r.cajas_finales())} de {N_CARACTERES} caracteres)")
+
+
 def ver_foto(ruta: str, factor: int = 6, guardar: Optional[str] = None):
     """Una figura (una pestaña/ventana) para UNA foto.
 
@@ -548,8 +567,10 @@ def ver_foto(ruta: str, factor: int = 6, guardar: Optional[str] = None):
     (en grises y en binario), con su tipo (detectada/proyectada) y sus valores (x, y, ancho x alto).
 
     Si se indica `guardar` (ruta de archivo), se guarda la figura en vez de dejarla abierta.
+    Además informa por consola el resultado de cada etapa y devuelve el Resultado.
     """
     r = analizar_foto(ruta)
+    informar(ruta, r)
     alto, ancho = r.binaria.shape
     g = r.giro
 
@@ -631,24 +652,27 @@ def ver_foto(ruta: str, factor: int = 6, guardar: Optional[str] = None):
     if guardar:
         fig.savefig(guardar, dpi=100)
         plt.close(fig)
+    return r
 
 
 def ver_resultados(rutas: List[str], factor: int = 6, guardar_prefijo: Optional[str] = None):
     """Una figura por foto (en un script, una ventana/pestaña por foto, todas abiertas a la vez;
     en un notebook, una debajo de otra).
     Con `guardar_prefijo="salida/patente"` guarda salida/patente_01.png, _02.png, ... en vez de mostrar."""
+    estados = []
     for i, ruta in enumerate(rutas, start=1):
         guardar = f"{guardar_prefijo}_{i:02d}.png" if guardar_prefijo else None
-        ver_foto(ruta, factor, guardar)
+        estados.append(ver_foto(ruta, factor, guardar).estado)
+    print(f"\nResumen de {len(estados)} fotos:  " + "  ".join(
+        f"{e}: {estados.count(e)}" for e in ("completo", "proyectado", "insuficiente")))
     if not guardar_prefijo:
         plt.show()
 
 
 # ============================================================
-# EJECUCIÓN DIRECTA:  python patentes.py [foto1.png foto2.png ...]
+# EJECUCIÓN DIRECTA:  python problema_2.py [foto1.png foto2.png ...]
 # ============================================================
 
 if __name__ == "__main__":
-    # rutas_fotos = sys.argv[1:] or [f"images/Patentes/img{i:02d}.png" for i in range(1, 13)]
     rutas_fotos = sys.argv[1:] or [f"images/Patentes/img{i:02d}.png" for i in range(1, 13)]
     ver_resultados(rutas_fotos)
