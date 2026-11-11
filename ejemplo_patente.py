@@ -3,7 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import problema_2 as p
 
-RUTA = "images/Patentes/img01.png"
+RUTA = "tp_procesamiento_de_imagenes_2/images/Patentes/img02.png"
 FACTOR = 6
 
 # ------------------------------------------------------------
