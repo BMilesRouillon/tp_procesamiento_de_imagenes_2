@@ -41,7 +41,6 @@ import matplotlib.pyplot as plt
 # Parámetros (ajustados sobre images/monedas.jpg)
 # =============================================================================
 
-# RUTA_BASE = os.path.dirname(os.path.abspath(__file__))
 RUTA_IMAGEN = 'images/monedas.jpg'
 CARPETA_SALIDA = 'images/output/'
 
